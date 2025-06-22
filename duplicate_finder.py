@@ -101,8 +101,10 @@ def load_cache(
 
 def find_duplicates(
     root_dir: Path,
-    force_rescan: bool = False,  # New argument
-) -> tuple[list[list[Path]], list[Path], dict[str, list[Path]]]:
+    force_rescan: bool = False,
+) -> tuple[
+    list[list[Path]], list[tuple[Path, int, float]], dict[str, list[Path]]
+]:  # Return metadata
     """
     Finds duplicate files in a directory using a multi-stage approach.
     Supports caching of previous scan results for faster subsequent runs.
@@ -114,7 +116,7 @@ def find_duplicates(
     Returns:
         A tuple containing:
         - A list of lists, where each inner list contains paths to confirmed duplicate files.
-        - A list of all file paths scanned (derived from metadata for consistency).
+        - A list of metadata tuples (path, size, mtime) for all files scanned.
         - A dictionary mapping a full file hash to a list of file paths for all likely duplicates.
     """
     if not root_dir.is_dir():
@@ -123,7 +125,7 @@ def find_duplicates(
     cache_path = root_dir / "finddupes_cache.json"
     CONSISTENCY_CHECK_PERCENTAGE = 0.10  # 10%
 
-    if cache_path.exists() and not force_rescan:
+    if cache_path.is_file() and not force_rescan:
         print(f"Cache file found at {cache_path}. Attempting to load and verify...")
         try:
             (
@@ -169,9 +171,7 @@ def find_duplicates(
 
             if is_consistent:
                 print("Cache is consistent. Using cached data.")
-                # Reconstruct all_files (just paths) from cached_all_files_metadata
-                all_files_paths = [f for f, _, _ in cached_all_files_metadata]
-                return cached_duplicates, all_files_paths, cached_full_hashes_map
+                return cached_duplicates, cached_all_files_metadata, cached_full_hashes_map
             else:
                 print("Cache is inconsistent. Performing full scan.")
                 # Clean up potentially corrupted/outdated cache file
@@ -261,12 +261,11 @@ def find_duplicates(
     )
 
     # Return all_files as just paths, as expected by other functions
-    all_files_paths_for_return = [f for f, _, _ in all_files_for_scan_and_cache]
-    return confirmed_duplicates, all_files_paths_for_return, full_hashes_map
+    return confirmed_duplicates, all_files_for_scan_and_cache, full_hashes_map
 
 
 def analyze_folder_duplicates(
-    all_files: list[Path],
+    all_files: list[tuple[Path, int, float]],  # Now receives metadata tuples
     full_hashes_map: dict[str, list[Path]],
 ) -> tuple[list[dict], dict]:  # Changed return type hint to reflect the actual return
     """
@@ -294,30 +293,32 @@ def analyze_folder_duplicates(
         for file in files_list
     }
 
-    for file in tqdm(all_files, desc="Building folder content signatures"):
+    for file_metadata in tqdm(all_files, desc="Building folder content signatures"):
+        file_path = file_metadata[0]  # Extract the Path object from the tuple
         try:
-            if file not in all_file_hashes:
-                file_hash = get_full_hash(file)
+            if file_path not in all_file_hashes:
+                file_hash = get_full_hash(file_path)  # Pass the Path object
                 if file_hash:
-                    all_file_hashes[file] = file_hash
+                    all_file_hashes[file_path] = file_hash
             else:
-                file_hash = all_file_hashes[file]  # Use already known hash
+                file_hash = all_file_hashes[file_path]  # Use already known hash
 
             if file_hash:
-                folder_content_signatures[file.parent].add(file_hash)
+                folder_content_signatures[file_path.parent].add(file_hash)
         except OSError:
             continue
 
     # --- 2. Calculate overall stats (including last modified time) for all folders ---
     folder_stats = defaultdict(lambda: {"size": 0, "files": 0, "last_modified": 0.0})
-    for file in tqdm(all_files, desc="Gathering folder stats"):
+    for file_path, size, mtime in tqdm(all_files, desc="Gathering folder stats"):
         try:
-            stat = file.stat()
-            folder = file.parent
+            # Unpack the tuple and use the pre-calculated metadata
+            # This avoids calling .stat() again and fixes the AttributeError
+            folder = file_path.parent
             folder_stats[folder]["files"] += 1
-            folder_stats[folder]["size"] += stat.st_size
+            folder_stats[folder]["size"] += size
             folder_stats[folder]["last_modified"] = max(
-                folder_stats[folder]["last_modified"], stat.st_mtime
+                folder_stats[folder]["last_modified"], mtime
             )
         except OSError:
             continue
@@ -363,12 +364,17 @@ def analyze_folder_duplicates(
     return folder_relationships, folder_stats
 
 
-def process_interactive_file_deletions(duplicate_sets: list[list[Path]]):
+def process_interactive_file_deletions(
+    duplicate_sets: list[list[Path]],
+) -> tuple[set[Path], set[Path]]:
     """Handles the interactive deletion process for duplicate files."""
+    deleted_individual_files = set()
+    deleted_folders = set()
+
     print("\n--- Interactive File Deletion Mode ---")
     if not duplicate_sets:
         print("No duplicate files found to process.")
-        return
+        return deleted_individual_files, deleted_folders
 
     # Sort sets by file size, largest first, for maximum impact
     try:
@@ -456,6 +462,7 @@ def process_interactive_file_deletions(duplicate_sets: list[list[Path]]):
                         try:
                             print(f"Deleting folder: {folder}")
                             shutil.rmtree(folder)
+                            deleted_folders.add(folder)
                             print(f"Successfully deleted {folder}")
                         except OSError as e:
                             print(f"ERROR: Could not delete {folder}. Reason: {e}")
@@ -471,6 +478,7 @@ def process_interactive_file_deletions(duplicate_sets: list[list[Path]]):
                     if file_to_delete != file_to_keep:
                         try:
                             print(f"  - Deleting: {file_to_delete}")
+                            deleted_individual_files.add(file_to_delete)
                             file_to_delete.unlink()
                         except OSError as e:
                             print(
@@ -479,69 +487,56 @@ def process_interactive_file_deletions(duplicate_sets: list[list[Path]]):
                 break  # Action complete for this group, move to the next.
 
     print("\n--- Interactive File Deletion Finished ---")
+    return deleted_individual_files, deleted_folders
 
 
-def process_interactive_deletions(folder_relationships: list[dict], folder_stats: dict):
+def process_interactive_deletions(
+    folder_relationships: list[dict], folder_stats: dict
+) -> set[Path]:
     """Handles the interactive deletion process for redundant folders."""
+    deleted_folders = set()
+
     print("\n--- Interactive Deletion Mode ---")
     if not folder_relationships:
         print("No redundant folder relationships found to process.")
-        return
+        return deleted_folders
 
-    deleted_folders = set()
-    for rel in folder_relationships:
-        folder_a_path, folder_b_path = (
-            (rel.get("folder_a"), rel.get("folder_b"))
-            if rel["type"] == "Exact Duplicate"
-            else (rel.get("subset"), rel.get("superset"))
-        )
+    exact_duplicates = [r for r in folder_relationships if r["type"] == "Exact Duplicate"]
+    subsets = [r for r in folder_relationships if r["type"] == "Subset"]
 
-        # Skip if either folder has already been deleted in this session
-        if folder_a_path in deleted_folders or folder_b_path in deleted_folders:
-            continue
+    # --- 1. Process Exact Duplicates ---
+    if exact_duplicates:
+        print("\n--- Processing Exact Duplicate Folders ---")
+        for rel in exact_duplicates:
+            folder_a_path, folder_b_path = rel["folder_a"], rel["folder_b"]
+            if folder_a_path in deleted_folders or folder_b_path in deleted_folders:
+                continue
 
-        info_a = folder_stats[folder_a_path]
-        info_b = folder_stats[folder_b_path]
+            info_a = folder_stats[folder_a_path]
+            info_b = folder_stats[folder_b_path]
+            dt_a = datetime.fromtimestamp(info_a["last_modified"]).strftime("%Y-%m-%d %H:%M:%S")
+            dt_b = datetime.fromtimestamp(info_b["last_modified"]).strftime("%Y-%m-%d %H:%M:%S")
+            size_a_mb = info_a["size"] / (1024 * 1024)
+            size_b_mb = info_b["size"] / (1024 * 1024)
 
-        # Prepare display strings
-        dt_a = datetime.fromtimestamp(info_a["last_modified"]).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        dt_b = datetime.fromtimestamp(info_b["last_modified"]).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        size_a_mb = info_a["size"] / (1024 * 1024)
-        size_b_mb = info_b["size"] / (1024 * 1024)
-
-        print("\n" + "=" * 80)
-        print(
-            f"[A] Path: {folder_a_path}\n    Files: {info_a['files']}, Size: {size_a_mb:.2f} MB, Last Modified: {dt_a}"
-        )
-        print(
-            f"[B] Path: {folder_b_path}\n    Files: {info_b['files']}, Size: {size_b_mb:.2f} MB, Last Modified: {dt_b}"
-        )
-
-        if rel["type"] == "Exact Duplicate":
+            print("\n" + "=" * 80)
+            print(f"[A] Path: {folder_a_path}\n    Files: {info_a['files']}, Size: {size_a_mb:.2f} MB, Last Modified: {dt_a}")
+            print(f"[B] Path: {folder_b_path}\n    Files: {info_b['files']}, Size: {size_b_mb:.2f} MB, Last Modified: {dt_b}")
             print("Relationship: Folders are EXACT DUPLICATES.")
-        else:
-            print(f"Relationship: Folder [A] is a SUBSET of folder [B].")
 
-        # Get user input
-        choice = ""
-        while choice.upper() not in ["A", "B", "S"]:
-            choice = input("Which folder to DELETE? [A] or [B] or (S)kip: ")
+            choice = ""
+            while choice.upper() not in ["A", "B", "S"]:
+                choice = input("Which folder to DELETE? [A] or [B] or (S)kip: ")
 
-        folder_to_delete = None
-        if choice.upper() == "A":
-            folder_to_delete = folder_a_path
-        elif choice.upper() == "B":
-            folder_to_delete = folder_b_path
-        else:
-            print("Skipping.")
-            continue
+            folder_to_delete = None
+            if choice.upper() == "A":
+                folder_to_delete = folder_a_path
+            elif choice.upper() == "B":
+                folder_to_delete = folder_b_path
+            else:
+                print("Skipping.")
+                continue
 
-        # Perform deletion
-        if folder_to_delete:
             try:
                 print(f"Deleting {folder_to_delete}...")
                 shutil.rmtree(folder_to_delete)
@@ -550,7 +545,36 @@ def process_interactive_deletions(folder_relationships: list[dict], folder_stats
             except OSError as e:
                 print(f"ERROR: Could not delete {folder_to_delete}. Reason: {e}")
 
+    # --- 2. Process Subset Folders ---
+    if subsets:
+        print("\n--- Processing Subset Folders ---")
+        for rel in subsets:
+            subset_folder, superset_folder = rel["subset"], rel["superset"]
+            if subset_folder in deleted_folders or superset_folder in deleted_folders:
+                continue
+
+            print("\n" + "=" * 80)
+            print(f"Subset folder:   {subset_folder}")
+            print(f"Master folder:   {superset_folder}")
+            print("Relationship: The first folder's contents are fully contained in the second.")
+
+            choice = ""
+            while choice.lower() not in ["y", "n", "s"]:
+                choice = input(f"Delete the SUBSET folder '{subset_folder.name}'? (y/n) or (s)kip: ")
+
+            if choice.lower() == "y":
+                try:
+                    print(f"Deleting {subset_folder}...")
+                    shutil.rmtree(subset_folder)
+                    print(f"Successfully deleted {subset_folder}")
+                    deleted_folders.add(subset_folder)
+                except OSError as e:
+                    print(f"ERROR: Could not delete {subset_folder}. Reason: {e}")
+            else:
+                print("Skipping.")
+
     print("\n--- Interactive Deletion Finished ---")
+    return deleted_folders
 
 
 def create_xlsx_report(
@@ -681,6 +705,38 @@ def create_xlsx_report(
     print(f"\nSuccessfully created duplicates report at: {report_path}")
 
 
+def update_scan_results(
+    deleted_files: set[Path],
+    original_duplicates: list[list[Path]],
+    original_metadata: list[tuple[Path, int, float]],
+    original_hashes_map: dict[str, list[Path]],
+) -> tuple[list[list[Path]], list[tuple[Path, int, float]], dict[str, list[Path]]]:
+    """
+    Updates in-memory scan results after files have been deleted.
+    """
+    print("Pruning in-memory scan results...")
+    # 1. Update all_files_metadata
+    updated_metadata = [
+        (p, s, m) for p, s, m in original_metadata if p not in deleted_files
+    ]
+
+    # 2. Update full_hashes_map
+    updated_hashes_map = defaultdict(list)
+    for h, files in original_hashes_map.items():
+        for f in files:
+            if f not in deleted_files:
+                updated_hashes_map[h].append(f)
+
+    # 3. Update confirmed_duplicates
+    updated_duplicates = []
+    for group in original_duplicates:
+        new_group = [f for f in group if f not in deleted_files]
+        if len(new_group) > 1:
+            updated_duplicates.append(new_group)
+
+    return updated_duplicates, updated_metadata, updated_hashes_map
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Find duplicate files in a specified folder and generate a report."
@@ -705,7 +761,7 @@ if __name__ == "__main__":
     target_directory = Path(args.folder)
 
     try:
-        duplicate_sets, all_files, full_hashes_map = find_duplicates(
+        duplicate_sets, all_files_metadata, full_hashes_map = find_duplicates(
             target_directory, args.force_rescan
         )
 
@@ -713,24 +769,54 @@ if __name__ == "__main__":
             print("\nNo duplicate files found.")
         else:
             print(f"\n--- Found {len(duplicate_sets)} sets of duplicate files ---")
+            deleted_files = set()
+            deleted_folders = set()
 
             if args.delete_files:
-                process_interactive_file_deletions(duplicate_sets)
+                (
+                    deleted_files,
+                    deleted_folders,
+                ) = process_interactive_file_deletions(duplicate_sets)
             elif args.interactive_delete:
                 # Enter interactive folder deletion mode
                 folder_analysis_results = analyze_folder_duplicates(
-                    all_files, full_hashes_map
+                    [p for p, s, m in all_files_metadata], full_hashes_map
                 )
                 relationships, stats = folder_analysis_results
-                process_interactive_deletions(relationships, stats)
+                deleted_folders = process_interactive_deletions(relationships, stats)
             else:
                 # Default behavior: generate a report
                 folder_analysis_results = analyze_folder_duplicates(
-                    all_files, full_hashes_map
+                    [p for p, s, m in all_files_metadata], full_hashes_map
                 )
                 print("Phase 3: Generating XLSX report...")
                 create_xlsx_report(
                     duplicate_sets, folder_analysis_results, target_directory
+                )
+
+            # If any deletions occurred, update and save the cache and report
+            if deleted_files or deleted_folders:
+                print("\nUpdating results after deletion...")
+                for file_path, _, _ in all_files_metadata:
+                    if any(folder in file_path.parents for folder in deleted_folders):
+                        deleted_files.add(file_path)
+
+                (
+                    updated_duplicates,
+                    updated_metadata,
+                    updated_hashes_map,
+                ) = update_scan_results(
+                    deleted_files, duplicate_sets, all_files_metadata, full_hashes_map
+                )
+
+                cache_path = target_directory / "finddupes_cache.json"
+                save_cache(updated_duplicates, updated_metadata, updated_hashes_map, cache_path)
+
+                updated_folder_analysis = analyze_folder_duplicates(
+                    [p for p, s, m in updated_metadata], updated_hashes_map
+                )
+                create_xlsx_report(
+                    updated_duplicates, updated_folder_analysis, target_directory
                 )
 
     except ValueError as e:
